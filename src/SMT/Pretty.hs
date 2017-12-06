@@ -1,3 +1,4 @@
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module SMT.Pretty
   (
   ) where
@@ -5,18 +6,26 @@ module SMT.Pretty
 import           SMT.Pretty.Prelude
 
 import           Control.Monad.Fail (fail)
+import           Data.Char (isHexDigit)
+import           Data.Scientific
 import qualified Data.Set as Set
 import qualified Data.Text as Text
+import qualified Data.Text.Prettyprint.Doc as PP
+import           Data.Text.Prettyprint.Doc hiding (parens, (<>))
+import           Numeric (readHex)
 import           Text.Megaparsec
 import           Text.Megaparsec.Char
 import qualified Text.Megaparsec.Char.Lexer as L
+import           Text.ParserCombinators.ReadP (ReadS)
 
 data Model =
   Model [DefineFun]
   deriving (Show)
 
-data Type =
-  Float16
+data Type
+  = Float16
+  | BitVec !Word
+  | ADTType !Text [Type]
   deriving (Show)
 
 data TypedVariable = TypedVariable
@@ -31,29 +40,170 @@ data DefineFun = DefineFun
   , funBody :: Expr
   } deriving (Show)
 
-data FPConstant = FPConstant
-  { fpSign :: !Text
-  , fpExp :: !Text
-  , fpMantissa :: !Text
-  } deriving (Show)
-
-fp :: Text -> Text -> Text -> FPConstant
-fp s e m = FPConstant s e m
-
-data Expr =
-  FP !FPConstant
+data FPConstant
+  = FPConstant { fpSign :: !Text
+               , fpExp :: !Text
+               , fpMantissa :: !Text }
+  | ZeroPos !Word
+            !Word
+  | ZeroNeg !Word
+            !Word
   deriving (Show)
+
+data BVConstant =
+  Hex !Text
+  deriving (Show)
+
+data Expr
+  = FP !FPConstant
+  | BV !BVConstant
+  | App !Expr [Expr]
+  | Var !Text
+  deriving (Show)
+
+data Signed = Signed | Unsigned
+
+data BVOptions = Binary | Hexadecimal | Decimal Signed
+
+data FPOptions = FPBinary | FPDecimal
+
+data Options = Options { bvOpts :: !BVOptions, fpOpts :: !FPOptions }
+
+newtype DocM a = DocM (Reader Options a)
+  deriving (Functor, Applicative, Monad, MonadReader Options)
+
+runDocM :: Options -> DocM a -> a
+runDocM o (DocM r) = runReader r o
+
+readBin :: Num a => Text -> a
+readBin t =
+  sum $
+  zipWith
+    (\c i ->
+       case c of
+         '0' -> 0
+         '1' -> 2 ^ i)
+    (reverse (toS t))
+    [0 ..]
+
+pow :: Scientific -> Int -> Scientific
+pow x e
+  | e >= 0 = x ^ e
+  | otherwise = 1 / (1 ^ e)
+
+fpToScientific :: Text -> Text -> Text -> Scientific
+fpToScientific s e m
+  | 16 == Text.length s + Text.length e + Text.length m =
+    let e' = readBin e :: Int
+        s' = (-1) ^ (readBin s :: Int) :: Scientific
+    in if e' == 0
+         then panic "denormalized"
+         else let m' = readBin ("1" <> m)
+              in s' * pow 2 (e' - 15) * m' / 2 ^ (10 :: Int)
+
+ppFPConstant :: FPConstant -> DocM (Doc a)
+ppFPConstant (FPConstant s e m) = do
+  opts <- fpOpts <$> ask
+  case opts of
+    FPBinary ->
+      pure
+        (PP.parens
+           ("fp" <+> "#b" <> pretty s <+> "#b" <> pretty e <+> "#b" <> pretty m))
+    FPDecimal -> pure (pretty (formatScientific Fixed Nothing (fpToScientific s e m)))
+ppFPConstant (ZeroPos e m) = do
+  opts <- fpOpts <$> ask
+  case opts of
+    FPBinary -> pure (PP.parens ("_" <+> "+zero" <+> pretty e <+> pretty m))
+    FPDecimal -> pure "+0"
+ppFPConstant (ZeroNeg e m) = do
+  opts <- fpOpts <$> ask
+  case opts of
+    FPBinary -> pure (PP.parens ("_" <+> "-zero" <+> pretty e <+> pretty m))
+    FPDecimal -> pure "-0"
+
+unsafeReadS :: ReadS a -> Text -> a
+unsafeReadS r t =
+  case r (toS t) of
+    [(x, [])] -> x
+    _ -> panic "readS failed"
+
+ppBVConstant :: BVConstant -> DocM (Doc a)
+ppBVConstant (Hex x) = do
+  opts <- bvOpts <$> ask
+  case opts of
+    Hexadecimal -> pure ("#x" <> pretty x)
+    Binary -> pure ("#b" <> pretty (concatMap hexLitToBin (toS x :: [Char])))
+    Decimal s -> do
+      let w = unsafeReadS readHex x :: Word32
+      case s of
+        Signed -> pure (pretty (fromIntegral w :: Int32))
+        Unsigned -> pure (pretty w)
+  where
+    hexLitToBin :: Char -> [Char]
+    hexLitToBin c =
+      case c of
+        '0' -> "0000"
+        '1' -> "0001"
+        '2' -> "0010"
+        '3' -> "0011"
+        '4' -> "0100"
+        '5' -> "0101"
+        '6' -> "0110"
+        '7' -> "0111"
+        '8' -> "1000"
+        '9' -> "1001"
+        'a' -> "1010"
+        'b' -> "1011"
+        'c' -> "1100"
+        'd' -> "1101"
+        'e' -> "1110"
+        'f' -> "1111"
+
+ppExpr :: Expr -> DocM (Doc a)
+ppExpr (FP fp) = ppFPConstant fp
+ppExpr (BV bv) = ppBVConstant bv
+ppExpr (App f xs) = do
+  ppF <- ppExpr f
+  ppXs <- mapM ppExpr xs
+  pure (PP.parens (ppF <+> align (vcat ppXs)))
+ppExpr (Var n) = pure (pretty n)
+
+ppModel :: Model -> DocM (Doc a)
+ppModel (Model defs) = do
+  ppDefs <- mapM ppDefineFun defs
+  pure $ PP.parens (vsep ["model", indent 4 (vsep ppDefs)])
+
+ppTypedVariable :: TypedVariable -> DocM (Doc a)
+ppTypedVariable (TypedVariable name ty) = do
+  ppTy <- ppType ty
+  pure (PP.parens (pretty name <+> ppTy))
+
+ppType :: Type -> DocM (Doc a)
+ppType Float16 = pure "Float16"
+ppType (BitVec w) = pure (PP.parens ("_" <+> "BitVec" <+> pretty w))
+ppType (ADTType name params) = do
+  ppParams <- mapM ppType params
+  pure (PP.parens (pretty name <+> sep ppParams))
+
+ppDefineFun :: DefineFun -> DocM (Doc a)
+ppDefineFun (DefineFun name params retTy body) = do
+  ppParams <- mapM ppTypedVariable params
+  ppRetTy <- ppType retTy
+  ppBody <- ppExpr body
+  pure $ PP.parens (vcat ["define-fun" <+> pretty name <+> PP.parens (sep ppParams) <+> ppRetTy, indent 4 ppBody])
 
 type Parser = Parsec Void Text
 
-modelTest :: Text
-modelTest =
-  Text.unlines
-    [ "(model"
-    , "  (define-fun x () Float16"
-    , "    (fp #b0 #b11011 #b0010010000))"
-    , ")"
-    ]
+test :: IO ()
+test = do
+  let f = "/home/moritz/tmp/test"
+  s <- readFile "/home/moritz/tmp/test"
+  case parse modelParser f s of
+    Left err -> do
+      putStrLn (parseErrorPretty' s err)
+      exitFailure
+    Right m ->
+      print (runDocM (Options (Decimal Signed) FPDecimal) (ppModel m))
 
 spaceConsumer :: Parser ()
 spaceConsumer = L.space space1 (L.skipLineComment ";") (fail "No block comments")
@@ -73,7 +223,9 @@ reservedWords = mempty
 identifier :: Parser Text
 identifier = (lexeme . try) (p >>= check)
   where
-    p = toS <$> ((:) <$> letterChar <*> many alphaNumChar)
+    cs :: [Char]
+    cs = "~!@$%^&*_-+=<>.?/"
+    p = toS <$> ((:) <$> (letterChar <|> oneOf cs) <*> many (alphaNumChar <|> oneOf cs))
     check x =
       if x `Set.member` reservedWords
         then fail $ "keyword " ++ show x ++ " cannot be an identifier"
@@ -94,18 +246,49 @@ defineFunParser = parens $ do
   pure (DefineFun name parameters returnType body)
 
 typeParser :: Parser Type
-typeParser = Float16 <$ symbol "Float16"
+typeParser = choice [Float16 <$ symbol "Float16", try bitvec <?> "BitVec type", adt <?> "ADT type"]
+  where
+    bitvec = BitVec <$> parens (symbol "_" *> symbol "BitVec" *> L.decimal)
+    adt =
+      parens (ADTType <$> identifier <*> many typeParser) <|>
+      ADTType <$> identifier <*> pure []
 
 typedVariableParser :: Parser TypedVariable
 typedVariableParser = parens (TypedVariable <$> identifier <*> typeParser)
 
-exprParser :: Parser Expr
-exprParser = choice [fpConstant]
-  where
-    fpConstant =
+fpConstant :: Parser FPConstant
+fpConstant =
+  choice
+    [ try $
       parens
-        (do symbol "fp"
-            FP <$> (fp <$> binaryLiteral <*> binaryLiteral <*> binaryLiteral))
+        (symbol "fp" *>
+         (FPConstant <$> binaryLiteral <*> binaryLiteral <*> binaryLiteral))
+    , try $
+      parens
+        (symbol "_" *> symbol "+zero" *>
+         (ZeroPos <$> lexeme L.decimal <*> lexeme L.decimal))
+    , parens
+        (symbol "_" *> symbol "-zero" *>
+         (ZeroNeg <$> lexeme L.decimal <*> lexeme L.decimal))
+    ]
+
+exprParser :: Parser Expr
+exprParser =
+  choice
+    [ try (FP <$> fpConstant) <?> "fp constant"
+    , try bvConstant <?> "bv constant"
+    , app <?> "app"
+    , var <?> "var"
+    ]
+  where
+    bvConstant = BV . Hex <$> hexLiteral
+    app = parens (App <$> exprParser <*> many exprParser)
+    var = Var <$> identifier
+
+hexLiteral :: Parser Text
+hexLiteral = lexeme $ do
+  _ <- string "#x"
+  toS <$> takeWhile1P (Just "hex literal") isHexDigit
 
 binaryLiteral :: Parser Text
 binaryLiteral = lexeme $ do
