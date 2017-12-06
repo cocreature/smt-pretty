@@ -1,22 +1,31 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module SMT.Pretty
-  (
+  ( resultParser
+  , ppResult
+  , runDocM
+  , Options(..)
+  , FPOptions(..)
+  , BVOptions(..)
+  , Signed(..)
   ) where
 
 import           SMT.Pretty.Prelude
 
 import           Control.Monad.Fail (fail)
-import           Data.Char (isHexDigit)
+import           Data.Char (intToDigit, isHexDigit)
 import           Data.Scientific
 import qualified Data.Set as Set
 import qualified Data.Text as Text
 import qualified Data.Text.Prettyprint.Doc as PP
 import           Data.Text.Prettyprint.Doc hiding (parens, (<>))
-import           Numeric (readHex)
+import           Numeric (readHex, showIntAtBase)
 import           Text.Megaparsec
 import           Text.Megaparsec.Char
 import qualified Text.Megaparsec.Char.Lexer as L
 import           Text.ParserCombinators.ReadP (ReadS)
+
+data Result = Sat !Model | Unsat
+  deriving (Show)
 
 data Model =
   Model [DefineFun]
@@ -132,32 +141,24 @@ ppBVConstant (Hex x) = do
   opts <- bvOpts <$> ask
   case opts of
     Hexadecimal -> pure ("#x" <> pretty x)
-    Binary -> pure ("#b" <> pretty (concatMap hexLitToBin (toS x :: [Char])))
+    Binary -> pure ("#b" <> pretty (concatMap hexDigitToBin (toS x :: [Char])))
     Decimal s -> do
       let w = unsafeReadS readHex x :: Word32
       case s of
         Signed -> pure (pretty (fromIntegral w :: Int32))
         Unsigned -> pure (pretty w)
-  where
-    hexLitToBin :: Char -> [Char]
-    hexLitToBin c =
-      case c of
-        '0' -> "0000"
-        '1' -> "0001"
-        '2' -> "0010"
-        '3' -> "0011"
-        '4' -> "0100"
-        '5' -> "0101"
-        '6' -> "0110"
-        '7' -> "0111"
-        '8' -> "1000"
-        '9' -> "1001"
-        'a' -> "1010"
-        'b' -> "1011"
-        'c' -> "1100"
-        'd' -> "1101"
-        'e' -> "1110"
-        'f' -> "1111"
+
+hexDigitToBin :: Char -> [Char]
+hexDigitToBin c =
+  leftPad
+    4
+    '0'
+    (showIntAtBase 2 intToDigit (unsafeReadS readHex (toS $ c : [])) "")
+
+leftPad :: Int -> a -> [a] -> [a]
+leftPad l x xs
+  | l > length xs = replicate (l - length xs) x ++ xs
+  | otherwise = xs
 
 ppExpr :: Expr -> DocM (Doc a)
 ppExpr (FP fp) = ppFPConstant fp
@@ -167,6 +168,12 @@ ppExpr (App f xs) = do
   ppXs <- mapM ppExpr xs
   pure (PP.parens (ppF <+> align (vcat ppXs)))
 ppExpr (Var n) = pure (pretty n)
+
+ppResult :: Result -> DocM (Doc a)
+ppResult (Sat m) = do
+  ppM <- ppModel m
+  pure (vcat ["sat", ppM] <> PP.line)
+ppResult Unsat = pure ("unsat" <> PP.line)
 
 ppModel :: Model -> DocM (Doc a)
 ppModel (Model defs) = do
@@ -194,17 +201,6 @@ ppDefineFun (DefineFun name params retTy body) = do
 
 type Parser = Parsec Void Text
 
-test :: IO ()
-test = do
-  let f = "/home/moritz/tmp/test"
-  s <- readFile "/home/moritz/tmp/test"
-  case parse modelParser f s of
-    Left err -> do
-      putStrLn (parseErrorPretty' s err)
-      exitFailure
-    Right m ->
-      print (runDocM (Options (Decimal Signed) FPDecimal) (ppModel m))
-
 spaceConsumer :: Parser ()
 spaceConsumer = L.space space1 (L.skipLineComment ";") (fail "No block comments")
 
@@ -230,6 +226,13 @@ identifier = (lexeme . try) (p >>= check)
       if x `Set.member` reservedWords
         then fail $ "keyword " ++ show x ++ " cannot be an identifier"
         else return x
+
+resultParser :: Parser Result
+resultParser = unsat <|> sat
+  where unsat = Unsat <$ symbol "unsat"
+        sat = do
+          _ <- symbol "sat"
+          Sat <$> modelParser
 
 modelParser :: Parser Model
 modelParser = parens $ do
