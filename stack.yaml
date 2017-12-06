@@ -1,0 +1,8 @@
+resolver: lts-9.17
+packages:
+- .
+extra-deps:
+  - megaparsec-6.2.0
+  - protolude-0.2
+flags: {}
+extra-package-dbs: []
