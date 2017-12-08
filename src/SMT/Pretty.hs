@@ -166,7 +166,7 @@ ppExpr (BV bv) = ppBVConstant bv
 ppExpr (App f xs) = do
   ppF <- ppExpr f
   ppXs <- mapM ppExpr xs
-  pure (PP.parens (ppF <+> align (vcat ppXs)))
+  pure (PP.parens (ppF <+> align (sep ppXs)))
 ppExpr (Var n) = pure (pretty n)
 
 ppResult :: Result -> DocM (Doc a)
